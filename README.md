@@ -14,7 +14,7 @@ will use the `pigments-lsp` extension ID.
 ## Install
 
 After the registry submission is accepted, open **Extensions** in Zed, search for
-**Zed Pigments**, and select **Install**. The extension downloads the matching
+**Pigments**, and select **Install**. The extension downloads the matching
 `pigment-lsp` binary for the current OS and architecture from this repository's
 [GitHub releases](https://github.com/JonathonRP/zed-pigments/releases).
 

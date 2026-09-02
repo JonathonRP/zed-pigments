@@ -105,6 +105,7 @@ struct ParseContext {
     stylesheet: bool,
     markup: bool,
     markdown: bool,
+    line_comments: bool,
 }
 
 impl ParseContext {
@@ -130,6 +131,27 @@ impl ParseContext {
                     | "tera (html)"
             ),
             markdown: matches!(language_id.as_str(), "markdown" | "md"),
+            line_comments: matches!(
+                language_id.as_str(),
+                "javascript"
+                    | "jsx"
+                    | "typescript"
+                    | "tsx"
+                    | "rust"
+                    | "go"
+                    | "java"
+                    | "c"
+                    | "c++"
+                    | "cpp"
+                    | "c#"
+                    | "csharp"
+                    | "kotlin"
+                    | "swift"
+                    | "scss"
+                    | "less"
+                    | "sass"
+                    | "stylus"
+            ),
         }
     }
 }
@@ -225,13 +247,17 @@ pub fn parse_document(text: &str, language_id: &str) -> Vec<ColorNode> {
     let resolved = resolve_definitions(&definitions.values);
 
     for (span, name) in scan_variable_references(text, &definitions.values, context) {
-        if definitions.declaration_spans.contains(&span)
-            || definitions.local_overrides.contains(&name)
-        {
+        if definitions.declaration_spans.contains(&span) {
+            continue;
+        }
+        let range = index.range(span);
+        if definitions.local_overrides.contains(&name) {
+            if resolved.contains_key(&name) {
+                nodes.retain(|node| !range_contains(range, node.range));
+            }
             continue;
         }
         if let Some(color) = resolved.get(&name) {
-            let range = index.range(span);
             nodes.retain(|node| !range_contains(range, node.range));
             // A bare Stylus variable can also spell a CSS named color. The local
             // assignment is more specific than the named-color interpretation.
@@ -824,7 +850,7 @@ fn has_assignment_before(
 
 fn excluded_hex_fragment(text: &str, span: Span, context: ParseContext) -> bool {
     let stylesheet = is_stylesheet_at(text, span.start, context);
-    let lexical = lexical_context_at(text, span.start);
+    let lexical = lexical_context_at(text, span.start, context);
     lexical.inside_url
         || (stylesheet && (appears_in_css_selector(text, span) || lexical.brackets > 0))
         || (context.markup && inside_markup_href(text, span.start))
@@ -851,7 +877,7 @@ struct LexicalContext {
     inside_url: bool,
 }
 
-fn lexical_context_at(text: &str, target: usize) -> LexicalContext {
+fn lexical_context_at(text: &str, target: usize, context: ParseContext) -> LexicalContext {
     let bytes = text.as_bytes();
     let mut offset = 0;
     let mut brackets: usize = 0;
@@ -895,7 +921,11 @@ fn lexical_context_at(text: &str, target: usize) -> LexicalContext {
             offset += 2;
             continue;
         }
-        if byte == b'/' && bytes.get(offset + 1) == Some(&b'/') {
+        if context.line_comments
+            && !functions.iter().any(|function| *function)
+            && byte == b'/'
+            && bytes.get(offset + 1) == Some(&b'/')
+        {
             line_comment = true;
             offset += 2;
             continue;
@@ -1138,6 +1168,19 @@ mod tests {
         assert!(matched_for("css", "a { fill: url(#abcdef); }").is_empty());
         assert!(matched_for("css", "a { fill: url(icons.svg?x=#fada55); }").is_empty());
         assert!(matched_for("css", r##"a { fill: url("#fada55"); }"##).is_empty());
+        for url in [
+            "http://example.com/image.png",
+            "https://example.com/image.png",
+            "data:image/svg+xml;base64,PHN2Zz4=",
+        ] {
+            assert_eq!(
+                matched_for(
+                    "css",
+                    &format!("a {{ background: url({url}); color: #abcdef; }}")
+                ),
+                vec!["#abcdef"]
+            );
+        }
         assert!(matched_for("html", r##"<a href="#abcdef">link</a>"##).is_empty());
         assert!(matched_for("html", r##"<a href="page.html?x=#fada55">link</a>"##).is_empty());
         assert!(matched_for("css", r##"[href="#abcdef"] {}"##).is_empty());
@@ -1173,6 +1216,15 @@ mod tests {
             matched_for("css", r##"a { content: "url("; color: #abcdef; }"##),
             vec!["#abcdef"]
         );
+        for language in ["javascript", "typescript", "rust"] {
+            assert_eq!(
+                matched_for(
+                    language,
+                    "// mention url( and [ syntax\nconst color = \"#abcdef\";"
+                ),
+                vec!["#abcdef"]
+            );
+        }
     }
 
     #[test]
@@ -1273,6 +1325,13 @@ mod tests {
             matched(unaffected),
             vec!["blue", "green", "red", "var(--y)"]
         );
+
+        let inactive_fallback =
+            ":root { --x: blue; } .dark { --x: red; } .light { color: var(--x, green); }";
+        assert_eq!(matched(inactive_fallback), vec!["blue", "red"]);
+
+        let active_fallback = ".light { color: var(--missing, green); }";
+        assert_eq!(matched(active_fallback), vec!["green"]);
 
         let markup = r##"<div style="--x: #f00; color: var(--x)"></div>"##;
         assert_eq!(matched_for("html", markup), vec!["#f00"]);

@@ -1,0 +1,738 @@
+use std::collections::{HashMap, HashSet};
+
+use csscolorparser::{Color, ParseColorError};
+use tower_lsp::lsp_types::{Position, Range};
+
+const COLOR_FUNCTIONS: &[&str] = &[
+    "hsl", "hsla", "hsv", "hsva", "hwb", "hwba", "lab", "lch", "oklab", "oklch", "rgb", "rgba",
+];
+const MAX_VARIABLE_DEPTH: usize = 32;
+
+#[derive(Debug, Clone)]
+pub struct ColorNode {
+    pub color: Color,
+    pub matched: String,
+    pub range: Range,
+}
+
+impl Eq for ColorNode {}
+
+impl PartialEq for ColorNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.matched == other.matched
+            && self.range == other.range
+            && self.color.to_rgba8() == other.color.to_rgba8()
+    }
+}
+
+impl ColorNode {
+    pub fn lsp_color(&self) -> tower_lsp::lsp_types::Color {
+        tower_lsp::lsp_types::Color {
+            red: self.color.r,
+            green: self.color.g,
+            blue: self.color.b,
+            alpha: self.color.a,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct Span {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(text: &str) -> Self {
+        let mut starts = vec![0];
+        for (offset, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                starts.push(offset + 1);
+            }
+        }
+        Self { starts }
+    }
+}
+
+struct SourceIndex<'a> {
+    text: &'a str,
+    lines: LineIndex,
+}
+
+impl<'a> SourceIndex<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            lines: LineIndex::new(text),
+        }
+    }
+
+    fn position(&self, byte_offset: usize) -> Position {
+        let line = self
+            .lines
+            .starts
+            .partition_point(|start| *start <= byte_offset)
+            - 1;
+        let line_start = self.lines.starts[line];
+        let character = self.text[line_start..byte_offset].encode_utf16().count();
+        Position::new(line as u32, character as u32)
+    }
+
+    fn range(&self, span: Span) -> Range {
+        Range::new(self.position(span.start), self.position(span.end))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct VariableDefinition {
+    value: String,
+    name_span: Span,
+}
+
+pub fn try_parse_color(value: &str) -> Result<Color, ParseColorError> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        return csscolorparser::parse(&format!("#{hex}"));
+    }
+
+    if let Ok(color) = try_parse_gpui_color(value) {
+        return Ok(color);
+    }
+
+    csscolorparser::parse(value)
+}
+
+/// Parse GPUI's normalized rgb/hsl forms, whose components are all in the 0..=1 range.
+fn try_parse_gpui_color(value: &str) -> Result<Color, ParseColorError> {
+    fn normalized(value: &str) -> Option<f32> {
+        value
+            .parse()
+            .ok()
+            .filter(|value| (0.0..=1.0).contains(value))
+    }
+
+    let value = value.trim();
+    let (name, parameters) = value
+        .split_once('(')
+        .and_then(|(name, rest)| rest.strip_suffix(')').map(|rest| (name.trim(), rest)))
+        .ok_or(ParseColorError::InvalidFunction)?;
+
+    if parameters.contains('%') || parameters.contains('/') {
+        return Err(ParseColorError::InvalidFunction);
+    }
+
+    let raw_values = parameters
+        .split(',')
+        .flat_map(str::split_ascii_whitespace)
+        .collect::<Vec<_>>();
+    // A trailing decimal point is accepted by Rust/GPUI but is not a CSS number.
+    // Without this marker, values such as rgb(0, 0, 1) must retain CSS's 0..255
+    // interpretation instead of becoming normalized bright blue.
+    if !raw_values.iter().take(3).any(|value| value.ends_with('.')) {
+        return Err(ParseColorError::InvalidFunction);
+    }
+
+    let values = raw_values
+        .into_iter()
+        .map(normalized)
+        .collect::<Option<Vec<_>>>()
+        .ok_or(ParseColorError::InvalidFunction)?;
+
+    if !(3..=4).contains(&values.len()) {
+        return Err(ParseColorError::InvalidFunction);
+    }
+
+    let alpha = values.get(3).copied().unwrap_or(1.0);
+    if name.eq_ignore_ascii_case("rgb") || name.eq_ignore_ascii_case("rgba") {
+        Ok(Color::new(values[0], values[1], values[2], alpha))
+    } else if name.eq_ignore_ascii_case("hsl") || name.eq_ignore_ascii_case("hsla") {
+        Ok(Color::from_hsla(
+            values[0] * 360.0,
+            values[1],
+            values[2],
+            alpha,
+        ))
+    } else {
+        Err(ParseColorError::InvalidFunction)
+    }
+}
+
+/// Parse all directly written colors and safely resolvable document-local variable references.
+pub fn parse(text: &str) -> Vec<ColorNode> {
+    let index = SourceIndex::new(text);
+    let mut nodes = scan_direct(text, &index);
+    let definitions = collect_definitions(text);
+    let resolved = resolve_definitions(&definitions);
+    let definition_spans = definitions
+        .values()
+        .map(|definition| definition.name_span)
+        .collect::<HashSet<_>>();
+
+    for (span, name) in scan_variable_references(text, &definitions) {
+        if definition_spans.contains(&span) {
+            continue;
+        }
+        if let Some(color) = resolved.get(&name) {
+            let range = index.range(span);
+            // A bare Stylus variable can also spell a CSS named color. The local
+            // assignment is more specific than the named-color interpretation.
+            nodes.retain(|node| node.range != range);
+            nodes.push(ColorNode {
+                color: color.clone(),
+                matched: text[span.start..span.end].to_owned(),
+                range,
+            });
+        }
+    }
+
+    nodes.sort_by_key(|node| {
+        (
+            node.range.start.line,
+            node.range.start.character,
+            node.range.end.line,
+            node.range.end.character,
+        )
+    });
+    nodes.dedup_by(|left, right| left.range == right.range);
+    nodes
+}
+
+fn scan_direct(text: &str, index: &SourceIndex<'_>) -> Vec<ColorNode> {
+    let bytes = text.as_bytes();
+    let mut nodes = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        let byte = bytes[offset];
+
+        if byte == b'#' {
+            if let Some(span) = scan_hex(text, offset, 1) {
+                if let Ok(color) = try_parse_color(&text[span.start..span.end]) {
+                    nodes.push(ColorNode {
+                        color,
+                        matched: text[span.start..span.end].to_owned(),
+                        range: index.range(span),
+                    });
+                    offset = span.end;
+                    continue;
+                }
+            }
+        } else if byte == b'0'
+            && matches!(bytes.get(offset + 1), Some(b'x' | b'X'))
+            && token_boundary_before(bytes, offset)
+        {
+            if let Some(span) = scan_hex(text, offset, 2) {
+                if let Ok(color) = try_parse_color(&text[span.start..span.end]) {
+                    nodes.push(ColorNode {
+                        color,
+                        matched: text[span.start..span.end].to_owned(),
+                        range: index.range(span),
+                    });
+                    offset = span.end;
+                    continue;
+                }
+            }
+        } else if byte.is_ascii_alphabetic() && token_boundary_before(bytes, offset) {
+            let end = take_while(bytes, offset, u8::is_ascii_alphabetic);
+            let name = &text[offset..end];
+
+            if bytes.get(end) == Some(&b'(')
+                && COLOR_FUNCTIONS
+                    .iter()
+                    .any(|function| name.eq_ignore_ascii_case(function))
+            {
+                if let Some(close) = matching_parenthesis(text, end) {
+                    let span = Span {
+                        start: offset,
+                        end: close + 1,
+                    };
+                    if let Ok(color) = try_parse_color(&text[span.start..span.end]) {
+                        nodes.push(ColorNode {
+                            color,
+                            matched: text[span.start..span.end].to_owned(),
+                            range: index.range(span),
+                        });
+                        offset = span.end;
+                        continue;
+                    }
+                }
+            } else if token_boundary_after(bytes, end)
+                && named_color_context(text, offset, end)
+                && name.bytes().all(|byte| byte.is_ascii_alphabetic())
+            {
+                if let Ok(color) = csscolorparser::parse(name) {
+                    let span = Span { start: offset, end };
+                    nodes.push(ColorNode {
+                        color,
+                        matched: name.to_owned(),
+                        range: index.range(span),
+                    });
+                    offset = end;
+                    continue;
+                }
+            }
+        }
+
+        offset += text[offset..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+
+    nodes
+}
+
+fn scan_hex(text: &str, start: usize, prefix_len: usize) -> Option<Span> {
+    let bytes = text.as_bytes();
+    if !token_boundary_before(bytes, start) {
+        return None;
+    }
+
+    let digits_start = start + prefix_len;
+    let digits_end = take_while(bytes, digits_start, u8::is_ascii_hexdigit);
+    let digits = digits_end - digits_start;
+    if !matches!(digits, 3 | 4 | 6 | 8) || !token_boundary_after(bytes, digits_end) {
+        return None;
+    }
+
+    Some(Span {
+        start,
+        end: digits_end,
+    })
+}
+
+fn matching_parenthesis(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (relative, character) in text[open..].char_indices() {
+        let absolute = open + relative;
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '(' {
+            depth += 1;
+        } else if character == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(absolute);
+            }
+        } else if character == '\n' && depth == 1 {
+            return None;
+        }
+    }
+    None
+}
+
+fn named_color_context(text: &str, start: usize, end: usize) -> bool {
+    let bytes = text.as_bytes();
+    let previous = previous_non_whitespace(bytes, start);
+    let next = next_non_whitespace(bytes, end);
+
+    if matches!(next.map(|(_, byte)| byte), Some(b':' | b'=' | b'('))
+        || matches!(previous.map(|(_, byte)| byte), Some(b'.' | b'#' | b'-'))
+    {
+        return false;
+    }
+
+    if let (Some((_, before @ (b'\'' | b'"'))), Some((_, after))) = (previous, next) {
+        if before == after {
+            let after_quote =
+                next.and_then(|(quote_offset, _)| next_non_whitespace(bytes, quote_offset + 1));
+            return !matches!(after_quote.map(|(_, byte)| byte), Some(b':'));
+        }
+    }
+
+    if matches!(previous.map(|(_, byte)| byte), Some(b'(' | b','))
+        && matches!(next.map(|(_, byte)| byte), Some(b')' | b',' | b';'))
+    {
+        return true;
+    }
+
+    let line_start = text[..start].rfind('\n').map_or(0, |offset| offset + 1);
+    let declaration_start = text[line_start..start]
+        .rfind([';', '{', '}'])
+        .map_or(line_start, |offset| line_start + offset + 1);
+    text[declaration_start..start]
+        .bytes()
+        .any(|byte| matches!(byte, b':' | b'='))
+}
+
+fn collect_definitions(text: &str) -> HashMap<String, VariableDefinition> {
+    let bytes = text.as_bytes();
+    let mut definitions = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        let start = offset;
+        let (name_end, allowed_colon) = if bytes[offset] == b'-'
+            && bytes.get(offset + 1) == Some(&b'-')
+            && token_boundary_before(bytes, offset)
+        {
+            (take_while(bytes, offset + 2, is_variable_character), true)
+        } else if matches!(bytes[offset], b'$' | b'@') && token_boundary_before(bytes, offset) {
+            (take_while(bytes, offset + 1, is_variable_character), true)
+        } else if (bytes[offset].is_ascii_alphabetic() || bytes[offset] == b'_')
+            && token_boundary_before(bytes, offset)
+        {
+            (take_while(bytes, offset + 1, is_variable_character), false)
+        } else {
+            offset += text[offset..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+            continue;
+        };
+
+        if name_end == start
+            || (matches!(bytes[start], b'-' | b'$' | b'@') && name_end <= start + 1)
+        {
+            offset += 1;
+            continue;
+        }
+
+        let delimiter_offset = skip_ascii_whitespace(bytes, name_end);
+        let delimiter = bytes.get(delimiter_offset).copied();
+        if delimiter != Some(b'=') && !(allowed_colon && delimiter == Some(b':')) {
+            offset = name_end;
+            continue;
+        }
+
+        let value_start = skip_ascii_whitespace(bytes, delimiter_offset + 1);
+        let value_end = text[value_start..]
+            .find([';', '\n', '\r', '}'])
+            .map_or(text.len(), |relative| value_start + relative);
+        let value = text[value_start..value_end].trim();
+        if !value.is_empty() {
+            let name = text[start..name_end].to_owned();
+            let definition = VariableDefinition {
+                value: value.to_owned(),
+                name_span: Span {
+                    start,
+                    end: name_end,
+                },
+            };
+            if !ambiguous.contains(&name) && definitions.insert(name.clone(), definition).is_some()
+            {
+                definitions.remove(&name);
+                ambiguous.insert(name);
+            }
+        }
+        offset = value_end.max(name_end);
+    }
+
+    definitions
+}
+
+fn resolve_definitions(
+    definitions: &HashMap<String, VariableDefinition>,
+) -> HashMap<String, Color> {
+    let mut resolved = HashMap::new();
+    for name in definitions.keys() {
+        let mut visiting = HashSet::new();
+        if let Some(color) = resolve_variable(name, definitions, &mut resolved, &mut visiting, 0) {
+            resolved.insert(name.clone(), color);
+        }
+    }
+    resolved
+}
+
+fn resolve_variable(
+    name: &str,
+    definitions: &HashMap<String, VariableDefinition>,
+    resolved: &mut HashMap<String, Color>,
+    visiting: &mut HashSet<String>,
+    depth: usize,
+) -> Option<Color> {
+    if let Some(color) = resolved.get(name) {
+        return Some(color.clone());
+    }
+    if depth >= MAX_VARIABLE_DEPTH || !visiting.insert(name.to_owned()) {
+        return None;
+    }
+
+    let value = definitions.get(name)?.value.trim();
+    let value = value
+        .strip_suffix("!default")
+        .or_else(|| value.strip_suffix("!global"))
+        .unwrap_or(value)
+        .trim();
+    let color = try_parse_color(value).ok().or_else(|| {
+        parse_exact_reference(value, definitions).and_then(|reference| {
+            resolve_variable(&reference, definitions, resolved, visiting, depth + 1)
+        })
+    });
+
+    visiting.remove(name);
+    if let Some(color) = color.as_ref() {
+        resolved.insert(name.to_owned(), color.clone());
+    }
+    color
+}
+
+fn parse_exact_reference(
+    value: &str,
+    definitions: &HashMap<String, VariableDefinition>,
+) -> Option<String> {
+    if let Some(inner) = value
+        .strip_prefix("var(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let name = inner.split(',').next()?.trim();
+        return definitions.contains_key(name).then(|| name.to_owned());
+    }
+
+    definitions.contains_key(value).then(|| value.to_owned())
+}
+
+fn scan_variable_references(
+    text: &str,
+    definitions: &HashMap<String, VariableDefinition>,
+) -> Vec<(Span, String)> {
+    let bytes = text.as_bytes();
+    let mut references = Vec::new();
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        if text[offset..].starts_with("var(") && token_boundary_before(bytes, offset) {
+            if let Some(close) = matching_parenthesis(text, offset + 3) {
+                let inner = &text[offset + 4..close];
+                if let Some(name) = inner.split(',').next().map(str::trim) {
+                    if definitions.contains_key(name) {
+                        references.push((
+                            Span {
+                                start: offset,
+                                end: close + 1,
+                            },
+                            name.to_owned(),
+                        ));
+                    }
+                }
+                offset = close + 1;
+                continue;
+            }
+        }
+
+        let prefixed = matches!(bytes[offset], b'$' | b'@')
+            || (bytes[offset] == b'-' && bytes.get(offset + 1) == Some(&b'-'));
+        if prefixed && token_boundary_before(bytes, offset) {
+            let prefix_len = if bytes[offset] == b'-' { 2 } else { 1 };
+            let end = take_while(bytes, offset + prefix_len, is_variable_character);
+            let name = &text[offset..end];
+            if definitions.contains_key(name) {
+                references.push((Span { start: offset, end }, name.to_owned()));
+            }
+            offset = end;
+            continue;
+        }
+
+        if (bytes[offset].is_ascii_alphabetic() || bytes[offset] == b'_')
+            && token_boundary_before(bytes, offset)
+        {
+            let end = take_while(bytes, offset + 1, is_variable_character);
+            let name = &text[offset..end];
+            if definitions.contains_key(name) && named_color_context(text, offset, end) {
+                references.push((Span { start: offset, end }, name.to_owned()));
+            }
+            offset = end;
+            continue;
+        }
+
+        offset += text[offset..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+
+    references
+}
+
+fn take_while(bytes: &[u8], mut offset: usize, predicate: fn(&u8) -> bool) -> usize {
+    while bytes.get(offset).is_some_and(predicate) {
+        offset += 1;
+    }
+    offset
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut offset: usize) -> usize {
+    while bytes
+        .get(offset)
+        .is_some_and(|byte| byte.is_ascii_whitespace() && *byte != b'\n' && *byte != b'\r')
+    {
+        offset += 1;
+    }
+    offset
+}
+
+fn is_variable_character(byte: &u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn is_token_character(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'$' | b'@')
+}
+
+fn token_boundary_before(bytes: &[u8], offset: usize) -> bool {
+    offset == 0 || !is_token_character(bytes[offset - 1])
+}
+
+fn token_boundary_after(bytes: &[u8], offset: usize) -> bool {
+    bytes
+        .get(offset)
+        .is_none_or(|byte| !is_token_character(*byte))
+}
+
+fn previous_non_whitespace(bytes: &[u8], offset: usize) -> Option<(usize, u8)> {
+    (0..offset)
+        .rev()
+        .find_map(|index| (!bytes[index].is_ascii_whitespace()).then_some((index, bytes[index])))
+}
+
+fn next_non_whitespace(bytes: &[u8], offset: usize) -> Option<(usize, u8)> {
+    (offset..bytes.len())
+        .find_map(|index| (!bytes[index].is_ascii_whitespace()).then_some((index, bytes[index])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn matched(text: &str) -> Vec<String> {
+        parse(text).into_iter().map(|node| node.matched).collect()
+    }
+
+    #[test]
+    fn parses_required_css_color_syntaxes() {
+        let text = r#"
+            a: #abc #abcd #aabbcc #aabbccdd;
+            b: 0xabc 0Xabcd 0xaabbcc 0XAABBCCDD;
+            c: rgb(255 0 0 / 50%) rgba(10%, 20%, 30%, .4);
+            d: hsl(120deg 50% 25% / .8) hsla(20, 30%, 40%, .5);
+            e: hwb(90 10% 20% / .3) lab(50% 40 30) lch(50% 20 30deg);
+            f: oklab(50% .1 .1 / .8) oklch(50% .1 120 / .8);
+        "#;
+        assert_eq!(parse(text).len(), 17);
+    }
+
+    #[test]
+    fn rejects_partial_hex_and_identifier_literals() {
+        assert!(parse("x: #12; y: #12345; z: #123456789; a: foo#fff;").is_empty());
+        assert!(parse("x: 0x12; y: 0x12345; z: 0x123456789; a: foo0xfff;").is_empty());
+    }
+
+    #[test]
+    fn named_colors_require_a_value_context() {
+        let text = "red fox\n.red {}\nlet red = token;\n\"red\": 1\ncolor: red;\nvalue = rebeccapurple;\n\"blue\"";
+        assert_eq!(matched(text), vec!["red", "rebeccapurple", "blue"]);
+    }
+
+    #[test]
+    fn resolves_css_sass_less_and_stylus_variables() {
+        let text = r#"
+            --brand: #123456;
+            --alias: var(--brand);
+            $sass: oklch(60% .1 40);
+            @less: $sass;
+            stylus = @less
+            a { color: var(--alias); background: $sass; border-color: @less; fill: stylus; }
+        "#;
+        let nodes = parse(text);
+        let references = nodes
+            .iter()
+            .filter(|node| {
+                matches!(
+                    node.matched.as_str(),
+                    "var(--alias)" | "$sass" | "@less" | "stylus"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(references.len(), 6);
+        assert!(references
+            .windows(2)
+            .all(|pair| pair[0].color.to_rgba8() != [0, 0, 0, 0]
+                && pair[1].color.to_rgba8() != [0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn stylus_variables_override_named_color_spelling() {
+        let nodes = parse("red = #0000ff\nbody\n  color: red");
+        let reference = nodes
+            .iter()
+            .find(|node| node.matched == "red" && node.range.start.line == 2)
+            .unwrap();
+        assert_eq!(reference.color.to_rgba8(), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn ignores_cycles_and_unresolved_variables() {
+        let text = "--a: var(--b); --b: var(--a); --missing: var(--nope); x: var(--a);";
+        assert!(parse(text).is_empty());
+    }
+
+    #[test]
+    fn ignores_ambiguous_duplicate_variable_definitions() {
+        let text = "--brand: red;\n--brand: blue;\na { color: var(--brand); }";
+        assert_eq!(matched(text), vec!["red", "blue"]);
+    }
+
+    #[test]
+    fn reports_utf16_positions() {
+        let text = "😀 café: #abc;\n文: rgb(1 2 3);";
+        let nodes = parse(text);
+        assert_eq!(
+            nodes[0].range,
+            Range::new(Position::new(0, 9), Position::new(0, 13))
+        );
+        assert_eq!(
+            nodes[1].range,
+            Range::new(Position::new(1, 3), Position::new(1, 13))
+        );
+    }
+
+    #[test]
+    fn parses_gpui_normalized_colors_without_stealing_css_syntax() {
+        assert_eq!(
+            try_parse_gpui_color("rgb(0., 1., 0.2)"),
+            Ok(Color::new(0.0, 1.0, 0.2, 1.0))
+        );
+        assert_eq!(
+            try_parse_gpui_color("hsla(0.5, 1., 0.5, 0.3)"),
+            Ok(Color::from_hsla(180.0, 1.0, 0.5, 0.3))
+        );
+        assert!(try_parse_gpui_color("rgb(255, 0, 0)").is_err());
+        assert!(try_parse_gpui_color("rgb(100% 0% 0%)").is_err());
+        assert_eq!(
+            try_parse_color("rgb(0, 0, 1)").unwrap().to_rgba8(),
+            [0, 0, 1, 255]
+        );
+        assert_eq!(
+            try_parse_color("rgb(1 1 1)").unwrap().to_rgba8(),
+            [1, 1, 1, 255]
+        );
+    }
+}

@@ -1,3 +1,5 @@
 build:
-	cargo build --release
-	sudo cp -f target/release/color-lsp /usr/local/bin/color-lsp
+	cargo build --release --package pigment-lsp
+
+test:
+	cargo test --workspace --all-targets --locked

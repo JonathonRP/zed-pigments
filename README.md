@@ -60,7 +60,9 @@ ignored.
 
 For safe CSS semantics, custom properties resolve only when declared at document top
 level or under `:root`. Selector-scoped custom properties are left unresolved rather
-than leaking their value into unrelated selectors.
+than leaking their value into unrelated selectors. If a name has any selector-scoped
+override, references to that name remain unresolved because selector inheritance is not
+modeled; unrelated global custom properties continue to resolve.
 
 ## Zed rendering
 

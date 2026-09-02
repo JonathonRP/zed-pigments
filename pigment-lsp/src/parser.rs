@@ -97,13 +97,7 @@ struct VariableDefinition {
 struct VariableDefinitions {
     values: HashMap<String, VariableDefinition>,
     declaration_spans: HashSet<Span>,
-    local_overrides: Vec<LocalOverride>,
-}
-
-#[derive(Debug)]
-struct LocalOverride {
-    name: String,
-    scope: Span,
+    local_overrides: HashSet<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -232,10 +226,7 @@ pub fn parse_document(text: &str, language_id: &str) -> Vec<ColorNode> {
 
     for (span, name) in scan_variable_references(text, &definitions.values, context) {
         if definitions.declaration_spans.contains(&span)
-            || definitions
-                .local_overrides
-                .iter()
-                .any(|local| local.name == name && span_within(span, local.scope))
+            || definitions.local_overrides.contains(&name)
         {
             continue;
         }
@@ -449,7 +440,7 @@ fn collect_definitions(text: &str, context: ParseContext) -> VariableDefinitions
     let bytes = text.as_bytes();
     let mut definitions = HashMap::new();
     let mut declaration_spans = HashSet::new();
-    let mut local_overrides = Vec::new();
+    let mut local_overrides = HashSet::new();
     let mut ambiguous = HashSet::new();
     let mut offset = 0;
 
@@ -498,17 +489,15 @@ fn collect_definitions(text: &str, context: ParseContext) -> VariableDefinitions
             offset = name_end;
             continue;
         }
-        let local_scope = (bytes[start] == b'-')
-            .then(|| css_custom_property_scope(text, start))
-            .flatten();
+        let local_override = bytes[start] == b'-' && css_custom_property_is_local(text, start);
 
         let value_start = skip_ascii_whitespace(bytes, delimiter_offset + 1);
         let value_end = text[value_start..]
             .find([';', '\n', '\r', '}'])
             .map_or(text.len(), |relative| value_start + relative);
         let value = text[value_start..value_end].trim();
-        if let Some(scope) = local_scope {
-            local_overrides.push(LocalOverride { name, scope });
+        if local_override {
+            local_overrides.insert(name);
             offset = value_end.max(name_end);
             continue;
         }
@@ -835,10 +824,9 @@ fn has_assignment_before(
 
 fn excluded_hex_fragment(text: &str, span: Span, context: ParseContext) -> bool {
     let stylesheet = is_stylesheet_at(text, span.start, context);
-    is_url_fragment(text, span.start)
-        || (stylesheet
-            && (appears_in_css_selector(text, span)
-                || inside_css_attribute_selector(text, span.start)))
+    let lexical = lexical_context_at(text, span.start);
+    lexical.inside_url
+        || (stylesheet && (appears_in_css_selector(text, span) || lexical.brackets > 0))
         || (context.markup && inside_markup_href(text, span.start))
 }
 
@@ -857,21 +845,96 @@ fn inside_style_element(text: &str, offset: usize) -> bool {
     prefix[open..].contains('>')
 }
 
-fn is_url_fragment(text: &str, hash_start: usize) -> bool {
-    let prefix = &text[..hash_start];
-    let lowercase = prefix.to_ascii_lowercase();
-    let Some(function_start) = lowercase.rfind("url(") else {
-        return false;
-    };
-    token_boundary_before(prefix.as_bytes(), function_start)
-        && !prefix[function_start + 4..].contains(')')
+#[derive(Default)]
+struct LexicalContext {
+    brackets: usize,
+    inside_url: bool,
 }
 
-fn inside_css_attribute_selector(text: &str, hash_start: usize) -> bool {
-    let prefix = &text[..hash_start];
-    let open = prefix.rfind('[');
-    let close = prefix.rfind(']');
-    open.is_some() && open > close
+fn lexical_context_at(text: &str, target: usize) -> LexicalContext {
+    let bytes = text.as_bytes();
+    let mut offset = 0;
+    let mut brackets: usize = 0;
+    let mut functions = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut line_comment = false;
+
+    while offset < target {
+        let byte = bytes[offset];
+        if block_comment {
+            if byte == b'*' && bytes.get(offset + 1) == Some(&b'/') {
+                block_comment = false;
+                offset += 2;
+            } else {
+                offset += 1;
+            }
+            continue;
+        }
+        if line_comment {
+            if matches!(byte, b'\n' | b'\r') {
+                line_comment = false;
+            }
+            offset += 1;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            offset += 1;
+            continue;
+        }
+        if byte == b'/' && bytes.get(offset + 1) == Some(&b'*') {
+            block_comment = true;
+            offset += 2;
+            continue;
+        }
+        if byte == b'/' && bytes.get(offset + 1) == Some(&b'/') {
+            line_comment = true;
+            offset += 2;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            offset += 1;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() && token_boundary_before(bytes, offset) {
+            let name_end = take_while(bytes, offset, u8::is_ascii_alphabetic);
+            if bytes.get(name_end) == Some(&b'(') {
+                functions.push(text[offset..name_end].eq_ignore_ascii_case("url"));
+                offset = name_end + 1;
+                continue;
+            }
+            offset = name_end;
+            continue;
+        }
+        match byte {
+            b'(' => functions.push(false),
+            b')' => {
+                functions.pop();
+            }
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            _ => {}
+        }
+        offset += text[offset..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
+    }
+
+    LexicalContext {
+        brackets,
+        inside_url: functions.iter().any(|function| *function),
+    }
 }
 
 fn inside_markup_href(text: &str, hash_start: usize) -> bool {
@@ -946,11 +1009,7 @@ fn inside_markup_href(text: &str, hash_start: usize) -> bool {
     false
 }
 
-fn span_within(inner: Span, outer: Span) -> bool {
-    outer.start <= inner.start && outer.end >= inner.end
-}
-
-fn css_custom_property_scope(text: &str, definition_start: usize) -> Option<Span> {
+fn css_custom_property_is_local(text: &str, definition_start: usize) -> bool {
     let mut braces = Vec::new();
     let mut quote = None;
     let mut escaped = false;
@@ -991,7 +1050,9 @@ fn css_custom_property_scope(text: &str, definition_start: usize) -> Option<Span
         }
     }
 
-    let open_brace = braces.last().copied()?;
+    let Some(open_brace) = braces.last().copied() else {
+        return false;
+    };
     let selector_start = text[..open_brace]
         .rfind([';', '{', '}'])
         .map_or(0, |offset| offset + 1);
@@ -1003,60 +1064,7 @@ fn css_custom_property_scope(text: &str, definition_start: usize) -> Option<Span
     } else {
         selector
     };
-    if contains_root_pseudo_class(selector) {
-        None
-    } else {
-        Some(Span {
-            start: open_brace,
-            end: matching_closing_brace(text, open_brace).unwrap_or(text.len()),
-        })
-    }
-}
-
-fn matching_closing_brace(text: &str, open_brace: usize) -> Option<usize> {
-    let mut depth = 0;
-    let mut quote = None;
-    let mut escaped = false;
-    let mut block_comment = false;
-    let mut characters = text[open_brace..].char_indices().peekable();
-
-    while let Some((relative, character)) = characters.next() {
-        if block_comment {
-            if character == '*' && characters.peek().is_some_and(|(_, next)| *next == '/') {
-                characters.next();
-                block_comment = false;
-            }
-            continue;
-        }
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-        if let Some(delimiter) = quote {
-            if character == delimiter {
-                quote = None;
-            }
-            continue;
-        }
-        if character == '/' && characters.peek().is_some_and(|(_, next)| *next == '*') {
-            characters.next();
-            block_comment = true;
-        } else if matches!(character, '\'' | '"') {
-            quote = Some(character);
-        } else if character == '{' {
-            depth += 1;
-        } else if character == '}' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(open_brace + relative + 1);
-            }
-        }
-    }
-    None
+    !contains_root_pseudo_class(selector)
 }
 
 fn contains_root_pseudo_class(selector: &str) -> bool {
@@ -1153,6 +1161,18 @@ mod tests {
             matched_for("html", r##"<div style="color:#abcdef"></div>"##),
             vec!["#abcdef"]
         );
+        assert_eq!(
+            matched_for("css", r##"a { content: "["; color: #abcdef; }"##),
+            vec!["#abcdef"]
+        );
+        assert_eq!(
+            matched_for("css", "/* mention url( syntax */ a { color: #abcdef; }"),
+            vec!["#abcdef"]
+        );
+        assert_eq!(
+            matched_for("css", r##"a { content: "url("; color: #abcdef; }"##),
+            vec!["#abcdef"]
+        );
     }
 
     #[test]
@@ -1240,9 +1260,19 @@ mod tests {
         let at_rule = "@supports selector(:root) { --x: blue; } a { color: var(--x); }";
         assert_eq!(matched(at_rule), vec!["blue"]);
 
-        let overridden =
-            ":root { --x: blue; } .dark { --x: red; color: var(--x); } .light { color: var(--x); }";
-        assert_eq!(matched(overridden), vec!["blue", "red", "var(--x)"]);
+        let same_block = ":root { --x: blue; } .dark { --x: red; color: var(--x); }";
+        assert_eq!(matched(same_block), vec!["blue", "red"]);
+
+        let descendant =
+            ":root { --x: blue; } .dark { --x: red; } .dark .child { color: var(--x); }";
+        assert_eq!(matched(descendant), vec!["blue", "red"]);
+
+        let unaffected =
+            ":root { --x: blue; --y: green; } .dark { --x: red; } .light { color: var(--y); }";
+        assert_eq!(
+            matched(unaffected),
+            vec!["blue", "green", "red", "var(--y)"]
+        );
 
         let markup = r##"<div style="--x: #f00; color: var(--x)"></div>"##;
         assert_eq!(matched_for("html", markup), vec!["#f00"]);

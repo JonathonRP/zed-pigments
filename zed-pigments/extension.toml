@@ -1,13 +1,13 @@
-id = "zed-pigments"
-name = "Zed Pigments"
+id = "pigments-lsp"
+name = "Pigments"
 description = "Atom Pigments-inspired document color previews powered by pigment-lsp."
-version = "0.1.0"
+version = "0.3.1"
 schema_version = 1
 authors = ["JonathonRP", "Jason Lee <huacnlee@gmail.com>"]
 repository = "https://github.com/JonathonRP/zed-pigments"
 
 [language_servers.pigment-lsp]
-name = "Zed Pigments"
+name = "Pigments"
 languages = [
     "Astro",
     "CSS",

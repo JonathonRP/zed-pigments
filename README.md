@@ -57,6 +57,10 @@ Sass (`$brand: ...`), Less (`@brand: ...`), and Stylus (`brand = ...` or
 directly to a color or another supported variable. Cycles and unresolved values are
 ignored.
 
+For safe CSS semantics, custom properties resolve only when declared at document top
+level or under `:root`. Selector-scoped custom properties are left unresolved rather
+than leaking their value into unrelated selectors.
+
 ## Zed rendering
 
 Set Zed's native document-color mode in `settings.json`:

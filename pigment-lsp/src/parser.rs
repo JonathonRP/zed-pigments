@@ -28,10 +28,10 @@ impl PartialEq for ColorNode {
 impl ColorNode {
     pub fn lsp_color(&self) -> tower_lsp::lsp_types::Color {
         tower_lsp::lsp_types::Color {
-            red: self.color.r,
-            green: self.color.g,
-            blue: self.color.b,
-            alpha: self.color.a,
+            red: self.color.r.clamp(0.0, 1.0),
+            green: self.color.g.clamp(0.0, 1.0),
+            blue: self.color.b.clamp(0.0, 1.0),
+            alpha: self.color.a.clamp(0.0, 1.0),
         }
     }
 }
@@ -106,7 +106,15 @@ pub fn try_parse_color(value: &str) -> Result<Color, ParseColorError> {
         return Ok(color);
     }
 
-    csscolorparser::parse(value)
+    if value
+        .bytes()
+        .any(|byte| matches!(byte, b'\n' | b'\r' | b'\t'))
+    {
+        let normalized = value.split_ascii_whitespace().collect::<Vec<_>>().join(" ");
+        csscolorparser::parse(&normalized)
+    } else {
+        csscolorparser::parse(value)
+    }
 }
 
 /// Parse GPUI's normalized rgb/hsl forms, whose components are all in the 0..=1 range.
@@ -181,9 +189,9 @@ pub fn parse(text: &str) -> Vec<ColorNode> {
         }
         if let Some(color) = resolved.get(&name) {
             let range = index.range(span);
+            nodes.retain(|node| !range_contains(range, node.range));
             // A bare Stylus variable can also spell a CSS named color. The local
             // assignment is more specific than the named-color interpretation.
-            nodes.retain(|node| node.range != range);
             nodes.push(ColorNode {
                 color: color.clone(),
                 matched: text[span.start..span.end].to_owned(),
@@ -213,7 +221,9 @@ fn scan_direct(text: &str, index: &SourceIndex<'_>) -> Vec<ColorNode> {
         let byte = bytes[offset];
 
         if byte == b'#' {
-            if let Some(span) = scan_hex(text, offset, 1) {
+            if let Some(span) =
+                scan_hex(text, offset, 1).filter(|span| !appears_in_css_selector(text, *span))
+            {
                 if let Ok(color) = try_parse_color(&text[span.start..span.end]) {
                     nodes.push(ColorNode {
                         color,
@@ -339,8 +349,6 @@ fn matching_parenthesis(text: &str, open: usize) -> Option<usize> {
             if depth == 0 {
                 return Some(absolute);
             }
-        } else if character == '\n' && depth == 1 {
-            return None;
         }
     }
     None
@@ -375,9 +383,7 @@ fn named_color_context(text: &str, start: usize, end: usize) -> bool {
     let declaration_start = text[line_start..start]
         .rfind([';', '{', '}'])
         .map_or(line_start, |offset| line_start + offset + 1);
-    text[declaration_start..start]
-        .bytes()
-        .any(|byte| matches!(byte, b':' | b'='))
+    has_color_assignment_context(text, declaration_start, start, end)
 }
 
 fn collect_definitions(text: &str) -> HashMap<String, VariableDefinition> {
@@ -418,6 +424,10 @@ fn collect_definitions(text: &str) -> HashMap<String, VariableDefinition> {
         let delimiter_offset = skip_ascii_whitespace(bytes, name_end);
         let delimiter = bytes.get(delimiter_offset).copied();
         if delimiter != Some(b'=') && !(allowed_colon && delimiter == Some(b':')) {
+            offset = name_end;
+            continue;
+        }
+        if bytes[start] == b'-' && !css_custom_property_is_global(text, start) {
             offset = name_end;
             continue;
         }
@@ -618,6 +628,191 @@ fn next_non_whitespace(bytes: &[u8], offset: usize) -> Option<(usize, u8)> {
         .find_map(|index| (!bytes[index].is_ascii_whitespace()).then_some((index, bytes[index])))
 }
 
+fn range_contains(outer: Range, inner: Range) -> bool {
+    outer.start <= inner.start && outer.end >= inner.end
+}
+
+fn has_color_assignment_context(
+    text: &str,
+    declaration_start: usize,
+    color_start: usize,
+    color_end: usize,
+) -> bool {
+    if !has_assignment_before(text, declaration_start, color_start) {
+        return false;
+    }
+
+    let line_end = text[color_end..]
+        .find(['\n', '\r'])
+        .map_or(text.len(), |relative| color_end + relative);
+    let tail = text[color_end..line_end].trim();
+    !tail.ends_with(['.', '?', '!'])
+}
+
+fn appears_in_css_selector(text: &str, span: Span) -> bool {
+    let statement_start = text[..span.start]
+        .rfind([';', '{', '}', '\n', '\r'])
+        .map_or(0, |offset| offset + 1);
+    if has_assignment_before(text, statement_start, span.start) {
+        return false;
+    }
+
+    let mut brackets: usize = 0;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in text[span.end..].chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            '{' => return true,
+            '=' if brackets == 0 => return false,
+            ';' | '}' => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn has_assignment_before(text: &str, statement_start: usize, value_start: usize) -> bool {
+    let prefix = &text[statement_start..value_start];
+    let mut brackets: usize = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut assignment = None;
+
+    for (offset, character) in prefix.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            ':' | '=' if brackets == 0 => assignment = Some((offset, character)),
+            _ => {}
+        }
+    }
+
+    let Some((separator, delimiter)) = assignment else {
+        return false;
+    };
+    if delimiter == '=' {
+        return true;
+    }
+
+    let property = prefix[..separator].trim();
+    let property = property
+        .strip_prefix(['\'', '"'])
+        .and_then(|property| property.strip_suffix(['\'', '"']))
+        .unwrap_or(property);
+    property
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || matches!(byte, b'_' | b'-'))
+        && property
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn css_custom_property_is_global(text: &str, definition_start: usize) -> bool {
+    let mut braces = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    let mut characters = text[..definition_start].char_indices().peekable();
+
+    while let Some((offset, character)) = characters.next() {
+        if block_comment {
+            if character == '*' && characters.peek().is_some_and(|(_, next)| *next == '/') {
+                characters.next();
+                block_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+        if character == '/' && characters.peek().is_some_and(|(_, next)| *next == '*') {
+            characters.next();
+            block_comment = true;
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '{' {
+            braces.push(offset);
+        } else if character == '}' {
+            braces.pop();
+        }
+    }
+
+    let Some(open_brace) = braces.last().copied() else {
+        return true;
+    };
+    let selector_start = text[..open_brace]
+        .rfind([';', '{', '}'])
+        .map_or(0, |offset| offset + 1);
+    contains_root_pseudo_class(&text[selector_start..open_brace])
+}
+
+fn contains_root_pseudo_class(selector: &str) -> bool {
+    selector.split(',').any(|selector| {
+        let selector = selector.trim();
+        !selector.starts_with('@')
+            && !selector
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b'>' | b'+' | b'~'))
+            && selector.match_indices(":root").any(|(offset, root)| {
+                let end = offset + root.len();
+                selector.as_bytes().get(end).is_none_or(|byte| {
+                    !byte.is_ascii_alphanumeric() && !matches!(byte, b'_' | b'-')
+                })
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,8 +842,34 @@ mod tests {
 
     #[test]
     fn named_colors_require_a_value_context() {
-        let text = "red fox\n.red {}\nlet red = token;\n\"red\": 1\ncolor: red;\nvalue = rebeccapurple;\n\"blue\"";
+        let text = "red fox\nWarning: red means stop.\n.red {}\nlet red = token;\n\"red\": 1\ncolor: red;\nvalue = rebeccapurple;\n\"blue\"";
         assert_eq!(matched(text), vec!["red", "rebeccapurple", "blue"]);
+    }
+
+    #[test]
+    fn excludes_css_id_selectors() {
+        assert_eq!(
+            matched(
+                ".foo #abcdef {}\n#abcdef[data-active=\"true\"] {}\n[data-active=true] #abcdef:hover {}\n#abcdef,\n.other {}\n#abcdef\n{}\na { color: #abcdef; }"
+            ),
+            vec!["#abcdef"]
+        );
+    }
+
+    #[test]
+    fn preserves_semicolonless_colors_before_nested_rules() {
+        let stylus = ".a {\n  color: #123\n  &:hover {\n    color: #456\n  }\n}";
+        assert_eq!(matched(stylus), vec!["#123", "#456"]);
+    }
+
+    #[test]
+    fn preserves_named_colors_in_css_shorthands() {
+        assert_eq!(
+            matched(
+                "a { box-shadow: red 0 0 5px; text-shadow: 1px 1px blue inset; outline: solid green 1px; }"
+            ),
+            vec!["red", "blue", "green"]
+        );
     }
 
     #[test]
@@ -701,6 +922,33 @@ mod tests {
     }
 
     #[test]
+    fn css_custom_properties_do_not_leak_across_scopes() {
+        let scoped = ".scope { --x: blue; } .other { color: var(--x); }";
+        assert_eq!(matched(scoped), vec!["blue"]);
+
+        let root = ":root { --x: blue; } .other { color: var(--x); }";
+        assert_eq!(matched(root), vec!["blue", "var(--x)"]);
+
+        let descendants = ":root .scope { --x: blue; } .other { color: var(--x); }";
+        assert_eq!(matched(descendants), vec!["blue"]);
+
+        let at_rule = "@supports selector(:root) { --x: blue; } a { color: var(--x); }";
+        assert_eq!(matched(at_rule), vec!["blue"]);
+    }
+
+    #[test]
+    fn resolved_css_variables_suppress_inactive_fallback_colors() {
+        let nodes = parse("--x: blue; a { color: var(--x, red); }");
+        assert_eq!(
+            matched("--x: blue; a { color: var(--x, red); }"),
+            vec!["blue", "var(--x, red)"]
+        );
+        assert_eq!(nodes[1].color.to_rgba8(), [0, 0, 255, 255]);
+
+        assert_eq!(matched("a { color: var(--missing, red); }"), vec!["red"]);
+    }
+
+    #[test]
     fn reports_utf16_positions() {
         let text = "😀 café: #abc;\n文: rgb(1 2 3);";
         let nodes = parse(text);
@@ -712,6 +960,29 @@ mod tests {
             nodes[1].range,
             Range::new(Position::new(1, 3), Position::new(1, 13))
         );
+    }
+
+    #[test]
+    fn parses_multiline_functions_with_utf16_ranges() {
+        let nodes = parse("😀: rgb(\n  255 0 0\n);");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].matched, "rgb(\n  255 0 0\n)");
+        assert_eq!(
+            nodes[0].range,
+            Range::new(Position::new(0, 4), Position::new(2, 1))
+        );
+    }
+
+    #[test]
+    fn clamps_wide_gamut_colors_to_lsp_channels() {
+        for value in ["lab(100% 125 125)", "oklab(100% .4 .4)"] {
+            let node = parse(&format!("color: {value};")).remove(0);
+            let color = node.lsp_color();
+            assert!((0.0..=1.0).contains(&color.red), "{value}: {color:?}");
+            assert!((0.0..=1.0).contains(&color.green), "{value}: {color:?}");
+            assert!((0.0..=1.0).contains(&color.blue), "{value}: {color:?}");
+            assert!((0.0..=1.0).contains(&color.alpha), "{value}: {color:?}");
+        }
     }
 
     #[test]

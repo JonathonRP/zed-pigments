@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use tower_lsp::lsp_types::{Color, ColorPresentation, Range, TextEdit};
 
 pub(crate) fn color_summary(color: Color) -> String {
@@ -52,7 +54,8 @@ pub(crate) fn color_presentations(
     labels.push(hex(color, color.alpha < 0.9995, false, false));
     labels.push(rgb(color, false, false));
     labels.push(hsl(color, false));
-    labels.dedup();
+    let mut seen = HashSet::new();
+    labels.retain(|label| seen.insert(label.clone()));
 
     labels
         .into_iter()
@@ -282,5 +285,17 @@ mod tests {
             Some(("hsl(0 0% 0%)", color(0.0, 0.0, 0.0, 1.0))),
         );
         assert_eq!(hsl[0].label, "hsl(0 100% 50%)");
+    }
+
+    #[test]
+    fn presentation_labels_are_unique_in_first_seen_order() {
+        let red = color(1.0, 0.0, 0.0, 1.0);
+        let presentations =
+            color_presentations(red, Range::default(), Some(("hsl(0 100% 50%)", red)));
+        let labels = presentations
+            .iter()
+            .map(|presentation| presentation.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["hsl(0 100% 50%)", "#ff0000", "rgb(255 0 0)"]);
     }
 }

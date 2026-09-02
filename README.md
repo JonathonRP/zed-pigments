@@ -37,7 +37,8 @@ Registry publication is a separate post-review step.
 
 Named colors are recognized only in declaration, assignment, argument, or quoted value
 contexts. An identifier such as `red` in prose, a class name, or a variable declaration
-is not treated as a color.
+is not treated as a color. Language-aware parsing keeps named colors out of Markdown
+prose while honoring CSS's case-insensitive property names.
 
 Document-local variables are resolved recursively for these common forms:
 

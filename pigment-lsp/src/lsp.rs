@@ -5,13 +5,14 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use crate::parser::{parse, ColorNode};
+use crate::parser::{parse_document, ColorNode};
 use crate::utils::{color_presentations, color_summary};
 
 const LSP_NAME: &str = "Zed Pigments";
 
 #[derive(Clone, Debug)]
 struct DocumentState {
+    language_id: String,
     version: i32,
     text: String,
     colors: Vec<ColorNode>,
@@ -31,10 +32,11 @@ impl Backend {
         {
             return;
         }
-        let colors = parse(&document.text);
+        let colors = parse_document(&document.text, &document.language_id);
         documents.insert(
             document.uri,
             DocumentState {
+                language_id: document.language_id,
                 version: document.version,
                 text: document.text,
                 colors,
@@ -62,7 +64,7 @@ impl Backend {
 
         match apply_content_changes(&document.text, &params.content_changes) {
             Ok(text) => {
-                document.colors = parse(&text);
+                document.colors = parse_document(&text, &document.language_id);
                 document.text = text;
                 document.version = version;
             }

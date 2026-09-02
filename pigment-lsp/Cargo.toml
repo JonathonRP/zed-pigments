@@ -1,0 +1,20 @@
+[package]
+name = "pigment-lsp"
+description = "The native document-color language server for Zed Pigments."
+license = "MIT"
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/JonathonRP/zed-pigments"
+keywords = ["color", "css", "lsp", "zed"]
+
+[dependencies]
+tokio = { version = "1.47.1", features = [
+    "io-util",
+    "io-std",
+    "macros",
+    "rt-multi-thread",
+    "sync",
+] }
+tower-lsp = "0.20.0"
+csscolorparser = "0.8.4"
+indoc = "2"

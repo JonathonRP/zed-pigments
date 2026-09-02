@@ -8,21 +8,23 @@ small Rust/WASM Zed extension. The project is inspired by
 [Atom Pigments](https://github.com/abe33/atom-pigments) and is based on
 [ColorLSP](https://github.com/huacnlee/color-lsp).
 
-This repository is preparing its first public release. It is not in the Zed extension
-registry yet.
+The extension is not in the Zed extension registry yet. Its first registry submission
+will use the `pigments-lsp` extension ID.
 
-## Install as a dev extension
+## Install
+
+After the registry submission is accepted, open **Extensions** in Zed, search for
+**Zed Pigments**, and select **Install**. The extension downloads the matching
+`pigment-lsp` binary for the current OS and architecture from this repository's
+[GitHub releases](https://github.com/JonathonRP/zed-pigments/releases).
+
+Until then, install it as a dev extension:
 
 1. Clone this repository.
 2. Build the server with `cargo build --release --package pigment-lsp`.
 3. Put `target/release` on the `PATH` inherited by Zed.
 4. In Zed, open **Extensions**, choose **Install Dev Extension**, and select the
    `zed-pigments` directory.
-
-Once reviewed releases exist, the extension will download the exact binary for the
-current OS and architecture from
-[`JonathonRP/zed-pigments`](https://github.com/JonathonRP/zed-pigments/releases).
-Registry publication is a separate post-review step.
 
 ## Supported colors
 
@@ -132,7 +134,7 @@ cargo test --workspace --all-targets --locked
 ```
 
 Release tags build `pigment-lsp` archives for x86-64 and ARM64 Windows, macOS, and
-Linux. Do not create a tag until the implementation has been reviewed.
+Linux, along with a `SHA256SUMS` file.
 
 ## Attribution and license
 
@@ -142,5 +144,4 @@ inspired by [abe33/atom-pigments](https://github.com/abe33/atom-pigments). Those
 and their contributors retain their respective copyright notices.
 
 This repository remains available under the [MIT License](LICENSE). The accepted MIT
-license is also retained inside the Zed extension directory for future registry
-submission.
+license is also retained inside the Zed extension directory for registry packaging.

@@ -1,4 +1,4 @@
-id = "zed-pigments"
+id = "pigments-lsp"
 name = "Zed Pigments"
 description = "Atom Pigments-inspired document color previews powered by pigment-lsp."
 version = "0.1.0"

@@ -78,7 +78,25 @@ Set Zed's native document-color mode in `settings.json`:
 default: it places a compact color swatch beside each value. Current Zed releases render
 that swatch as a **square**, not a circle. The Zed extension and LSP APIs do not expose
 the swatch shape, and Zed Pigments deliberately does not insert Unicode markers or edit
-your document to imitate one. A circular dot requires a Zed core renderer change.
+your document to imitate one. Upstream circle support is tracked in
+[zed-industries/zed#63594](https://github.com/zed-industries/zed/issues/63594).
+
+An optional [personal Zed branch with swatch-shape
+support](https://github.com/JonathonRP/zed/tree/jonathonrp-color-swatch-shape) implements
+the required core renderer change. Builds from that branch can enable circular inlays
+with:
+
+```json
+{
+  "lsp_document_colors": "inlay",
+  "lsp_document_color_inlay_shape": "circle"
+}
+```
+
+`lsp_document_color_inlay_shape` is available only on that personal branch; it is not a
+setting in released upstream Zed yet. Upstream users should keep the standard
+`"lsp_document_colors": "inlay"` configuration above, which remains fully compatible
+and renders square swatches.
 
 The other native modes are `"border"`, `"background"`, and `"none"`. Border and
 background can be useful when a larger preview is preferred.

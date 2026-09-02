@@ -1,6 +1,6 @@
 [package]
 name = "zed-pigments"
-version = "0.1.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/JonathonRP/zed-pigments"
